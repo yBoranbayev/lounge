@@ -1263,6 +1263,63 @@ func assignQueuedUserToDevice(userID string, deviceID int) error {
 	return nil
 }
 
+func switchUserStation(userID string, newDeviceID int) error {
+	u := getUserByID(userID)
+	if u == nil {
+		return fmt.Errorf("user ID %s not found", userID)
+	}
+	if u.PCID == 0 {
+		return fmt.Errorf("user %s is in queue, use assign instead", userID)
+	}
+
+	oldDeviceID := u.PCID
+	if oldDeviceID == newDeviceID {
+		return fmt.Errorf("user is already on device %d", newDeviceID)
+	}
+
+	newDevice := getDeviceByID(newDeviceID)
+	if newDevice == nil {
+		return fmt.Errorf("target device ID %d does not exist", newDeviceID)
+	}
+
+	// Check if new device is available
+	if newDevice.Type == "PC" && newDevice.Status != "free" {
+		return fmt.Errorf("device %d is busy (occupied by UserID: %s)", newDeviceID, newDevice.UserID)
+	}
+
+	// Store user info before checkout
+	userName := u.Name
+	userID_copy := u.ID
+
+	// Step 1: Check out from old device
+	// This will:
+	// - Record checkout time in log
+	// - Calculate usage time for old device
+	// - Free up the old device
+	// - Remove user from activeUsers
+	if err := checkoutUser(userID); err != nil {
+		return fmt.Errorf("failed to checkout from device %d: %w", oldDeviceID, err)
+	}
+
+	// Step 2: Check in to new device
+	// This will:
+	// - Record new check-in time in log
+	// - Occupy the new device
+	// - Add user back to activeUsers with new device
+	if err := registerUser(userName, userID_copy, newDeviceID); err != nil {
+		// If check-in fails, try to restore user to original device
+		// This is a rollback attempt
+		restoreErr := registerUser(userName, userID_copy, oldDeviceID)
+		if restoreErr != nil {
+			return fmt.Errorf("switch failed and rollback failed - user may be in inconsistent state: original error: %w, rollback error: %v", err, restoreErr)
+		}
+		return fmt.Errorf("failed to check in to device %d (restored to device %d): %w", newDeviceID, oldDeviceID, err)
+	}
+
+	refreshTrigger <- true
+	return nil
+}
+
 func getPendingUsers() []User {
 	out := []User{}
 	for _, u := range activeUsers {
@@ -1547,6 +1604,105 @@ func showCheckOutDialog() {
 	dlg.Show()
 }
 
+// Add this function after showCheckOutDialog (around line 1020)
+
+func showSwitchStationDialog() {
+	if len(activeUsers) == 0 {
+		dialog.ShowInformation("Switch Station", "No active users to switch.", mainWindow)
+		return
+	}
+
+	// Filter only users currently assigned to a device (not in queue)
+	assignedUsers := []User{}
+	for _, u := range activeUsers {
+		if u.PCID != 0 {
+			assignedUsers = append(assignedUsers, u)
+		}
+	}
+
+	if len(assignedUsers) == 0 {
+		dialog.ShowInformation("Switch Station", "No users currently assigned to devices.", mainWindow)
+		return
+	}
+
+	display := make([]string, len(assignedUsers))
+	userRefs := make([]User, len(assignedUsers))
+
+	for i, u := range assignedUsers {
+		displayName := u.Name
+		if len(displayName) > 25 {
+			displayName = displayName[:22] + "..."
+		}
+		deviceType := "PC"
+		d := getDeviceByID(u.PCID)
+		if d != nil && d.Type == "Console" {
+			deviceType = "Console"
+		}
+		display[i] = fmt.Sprintf("%s (%s) - Currently on %s %d", displayName, u.ID, deviceType, u.PCID)
+		userRefs[i] = u
+	}
+
+	userSelector := widget.NewSelect(display, nil)
+	userSelector.PlaceHolder = "Select User to Switch"
+
+	deviceEntry := widget.NewEntry()
+	deviceEntry.SetPlaceHolder("Enter New Device ID (1-18)")
+
+	form := widget.NewForm(
+		widget.NewFormItem("User:", userSelector),
+		widget.NewFormItem("New Device:", deviceEntry),
+	)
+
+	dlg := dialog.NewCustomConfirm("Switch Station", "Switch", "Cancel", form, func(ok bool) {
+		if !ok {
+			return
+		}
+
+		if userSelector.Selected == "" {
+			dialog.ShowError(fmt.Errorf("please select a user"), mainWindow)
+			return
+		}
+
+		newDeviceText := strings.TrimSpace(deviceEntry.Text)
+		if newDeviceText == "" {
+			dialog.ShowError(fmt.Errorf("please enter a device ID"), mainWindow)
+			return
+		}
+
+		newDeviceID, err := strconv.Atoi(newDeviceText)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("invalid device ID: must be a number"), mainWindow)
+			return
+		}
+
+		// Find the selected user
+		var selectedUser *User
+		for i, s := range display {
+			if s == userSelector.Selected {
+				selectedUser = &userRefs[i]
+				break
+			}
+		}
+
+		if selectedUser == nil {
+			dialog.ShowError(fmt.Errorf("invalid user selection"), mainWindow)
+			return
+		}
+
+		if err := switchUserStation(selectedUser.ID, newDeviceID); err != nil {
+			dialog.ShowError(err, mainWindow)
+			return
+		}
+
+		dialog.ShowInformation("Success",
+			fmt.Sprintf("Switched %s from device %d to device %d", selectedUser.Name, selectedUser.PCID, newDeviceID),
+			mainWindow)
+	}, mainWindow)
+
+	dlg.Resize(fyne.NewSize(500, dlg.MinSize().Height))
+	dlg.Show()
+}
+
 // ---------- Main ----------
 
 func main() {
@@ -1561,10 +1717,11 @@ func main() {
 	deviceStatus := buildDeviceRoomContent()
 	logView := buildLogView()
 
+	// Update this section in main() (around line 1040)
 	checkInButton := widget.NewButtonWithIcon("Check In", theme.ContentAddIcon(), showCheckInDialog)
 	checkOutButton := widget.NewButtonWithIcon("Check Out", theme.ContentRemoveIcon(), showCheckOutDialog)
-	toolbar := container.NewHBox(checkInButton, checkOutButton, layout.NewSpacer())
-
+	switchButton := widget.NewButtonWithIcon("Switch Station", theme.NavigateNextIcon(), showSwitchStationDialog)
+	toolbar := container.NewHBox(checkInButton, checkOutButton, switchButton, layout.NewSpacer())
 	totalDevicesLabel := widget.NewLabel("")
 	activeUsersLabel := widget.NewLabel("")
 
